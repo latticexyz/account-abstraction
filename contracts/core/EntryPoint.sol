@@ -66,6 +66,18 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         require(success, "AA91 failed send to beneficiary");
     }
 
+    function _executeUserOp(
+        uint256 opIndex,
+        PackedUserOperation calldata userOp,
+        UserOpInfo memory opInfo
+    )
+    internal
+    returns
+    (uint256 collected) {
+        GasInfo memory gasInfo;
+        return _executeUserOp(opIndex, userOp, opInfo, gasInfo);
+    }
+
     /**
      * Execute a user operation.
      * @param opIndex    - Index into the opInfo array.
@@ -76,7 +88,8 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
     function _executeUserOp(
         uint256 opIndex,
         PackedUserOperation calldata userOp,
-        UserOpInfo memory opInfo
+        UserOpInfo memory opInfo,
+        GasInfo memory gasInfo
     )
     internal
     returns
@@ -105,10 +118,15 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
             {
                 innerCall = abi.encodeCall(this.innerHandleOp, (callData, opInfo, context));
             }
-            assembly ("memory-safe") {
-                success := call(gas(), address(), 0, add(innerCall, 0x20), mload(innerCall), 0, 32)
-                collected := mload(0)
-                mstore(0x40, saveFreePtr)
+            bytes memory innerCallResult;
+            (success, innerCallResult) = address(this).call(innerCall);
+
+            if(success) {
+                uint256 callGasUsed;
+                uint256 paymasterPostOpGasUsed;
+                (collected, callGasUsed, paymasterPostOpGasUsed) = abi.decode(innerCallResult, (uint256, uint256, uint256));
+                gasInfo.callGas = callGasUsed;
+                gasInfo.paymasterPostOpGas = paymasterPostOpGasUsed;
             }
         }
         if (!success) {
@@ -126,7 +144,8 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
                 revert FailedOp(opIndex, "AA95 out of gas");
             } else if (innerRevertCode == INNER_REVERT_LOW_PREFUND) {
                 // innerCall reverted on prefund too low. treat entire prefund as "gas cost"
-                uint256 actualGas = preGas - gasleft() + opInfo.preOpGas;
+                gasInfo.callGas = preGas - gasleft();
+                uint256 actualGas = gasInfo.callGas + opInfo.preOpGas;
                 uint256 actualGasCost = opInfo.prefund;
                 emitPrefundTooLow(opInfo);
                 emitUserOperationEvent(opInfo, false, actualGasCost, actualGas);
@@ -139,13 +158,16 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
                     Exec.getReturnData(REVERT_REASON_MAX_LEN)
                 );
 
-                uint256 actualGas = preGas - gasleft() + opInfo.preOpGas;
-                collected = _postExecution(
+                gasInfo.callGas = preGas - gasleft();
+                uint256 actualGas = gasInfo.callGas + opInfo.preOpGas;
+                uint256 paymasterPostOpGasUsed;
+                (collected, paymasterPostOpGasUsed) = _postExecution(
                     IPaymaster.PostOpMode.postOpReverted,
                     opInfo,
                     context,
                     actualGas
                 );
+                gasInfo.paymasterPostOpGas = paymasterPostOpGasUsed;
             }
         }
     }
@@ -303,6 +325,13 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         uint256 preOpGas;
     }
 
+    struct GasInfo {
+        uint256 verificationGas;
+        uint256 callGas;
+        uint256 paymasterVerificationGas;
+        uint256 paymasterPostOpGas;
+    }
+
     /**
      * Inner function to handle a UserOperation.
      * Must be declared "external" to open a call context, but it can only be called by handleOps.
@@ -315,7 +344,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         bytes memory callData,
         UserOpInfo memory opInfo,
         bytes calldata context
-    ) external returns (uint256 actualGasCost) {
+    ) external returns (uint256 actualGasCost, uint256 callGasUsed, uint256 paymasterPostOpGasUsed) {
         uint256 preGas = gasleft();
         require(msg.sender == address(this), "AA92 internal call only");
         MemoryUserOp memory mUserOp = opInfo.mUserOp;
@@ -354,8 +383,9 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         }
 
         unchecked {
-            uint256 actualGas = preGas - gasleft() + opInfo.preOpGas;
-            return _postExecution(mode, opInfo, context, actualGas);
+            callGasUsed = preGas - gasleft();
+            uint256 actualGas = callGasUsed + opInfo.preOpGas;
+            (actualGasCost, paymasterPostOpGasUsed) = _postExecution(mode, opInfo, context, actualGas);
         }
     }
 
@@ -606,6 +636,18 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         aggregator = data.aggregator;
     }
 
+    function _validatePrepayment(
+        uint256 opIndex,
+        PackedUserOperation calldata userOp,
+        UserOpInfo memory outOpInfo
+    )
+        internal
+        returns (uint256 validationData, uint256 paymasterValidationData)
+    {
+        GasInfo memory gasInfo;
+        return _validatePrepayment(opIndex, userOp, outOpInfo, gasInfo);
+    }
+
     /**
      * Validate account and paymaster (if defined) and
      * also make sure total validation doesn't exceed verificationGasLimit.
@@ -616,7 +658,8 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
     function _validatePrepayment(
         uint256 opIndex,
         PackedUserOperation calldata userOp,
-        UserOpInfo memory outOpInfo
+        UserOpInfo memory outOpInfo,
+        GasInfo memory gasInfo
     )
         internal
         returns (uint256 validationData, uint256 paymasterValidationData)
@@ -659,17 +702,22 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
 
         bytes memory context;
         if (mUserOp.paymaster != address(0)) {
+            uint256 prePaymasterGas = gasleft();
             (context, paymasterValidationData) = _validatePaymasterPrepayment(
                 opIndex,
                 userOp,
                 outOpInfo,
                 requiredPreFund
             );
+            unchecked {
+                gasInfo.paymasterVerificationGas = prePaymasterGas - gasleft();
+            }
         }
         unchecked {
             outOpInfo.prefund = requiredPreFund;
             outOpInfo.contextOffset = getOffsetOfMemoryBytes(context);
             outOpInfo.preOpGas = preGas - gasleft() + userOp.preVerificationGas;
+            gasInfo.verificationGas = outOpInfo.preOpGas;
         }
     }
 
@@ -687,7 +735,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
         UserOpInfo memory opInfo,
         bytes memory context,
         uint256 actualGas
-    ) private returns (uint256 actualGasCost) {
+    ) private returns (uint256 actualGasCost, uint256 paymasterPostOpGasUsed) {
         uint256 preGas = gasleft();
         unchecked {
             address refundAddress;
@@ -700,6 +748,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
             } else {
                 refundAddress = paymaster;
                 if (context.length > 0) {
+                    uint256 prePaymasterGas = gasleft();
                     actualGasCost = actualGas * gasPrice;
                     if (mode != IPaymaster.PostOpMode.postOpReverted) {
                         try IPaymaster(paymaster).postOp{
@@ -711,6 +760,7 @@ contract EntryPoint is IEntryPoint, StakeManager, NonceManager, ReentrancyGuard,
                             revert PostOpReverted(reason);
                         }
                     }
+                    paymasterPostOpGasUsed = prePaymasterGas - gasleft();
                 }
             }
             actualGas += preGas - gasleft();
