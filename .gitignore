@@ -2,7 +2,6 @@ node_modules
 
 #Hardhat files
 cache
-artifacts
 /.idea/
 /typechain/
 /dist/
@@ -18,3 +17,12 @@ artifacts
 .DS_Store
 /contracts/dist/
 /contracts/types/
+
+artifacts/*
+!artifacts/contracts
+artifacts/contracts/*
+!artifacts/contracts/core
+artifacts/contracts/core/*
+!artifacts/contracts/core/EntryPointGasSimulations.sol
+artifacts/contracts/core/EntryPointGasSimulations.sol/*
+!artifacts/contracts/core/EntryPointGasSimulations.sol/EntryPointGasSimulations.json
